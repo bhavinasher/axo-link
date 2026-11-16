@@ -15,6 +15,11 @@ contextBridge.exposeInMainWorld('axo', {
   deny: (id) => ipcRenderer.invoke('deny', id),
   stop: (id) => ipcRenderer.invoke('stop', id),
   resize: (expanded) => ipcRenderer.send('resize', expanded),
+  // Moving the pill by its bar. Main reads the cursor itself, so these carry
+  // no coordinates.
+  dragStart: () => ipcRenderer.send('drag-start'),
+  dragMove: () => ipcRenderer.send('drag-move'),
+  dragEnd: () => ipcRenderer.send('drag-end'),
 
   // --- voice ---
   select: (id) => ipcRenderer.send('select', id),
