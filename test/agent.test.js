@@ -15,7 +15,7 @@ function fakeSpawn() {
   child.stdin = new PassThrough();
   child.written = [];
   child.stdin.on('data', (d) => child.written.push(String(d)));
-  child.kill = () => child.emit('exit', 0);
+  child.kill = () => { child.killed = true; child.emit('exit', 0); };
   fakeSpawn.last = child;
   return child;
 }
@@ -102,6 +102,31 @@ test('approve continues the same session instead of starting a new one', async (
   assert.equal(after.waiting_kind, null, 'stale approval must not linger');
   assert.deepEqual(after.pending, []);
   assert.match(child.written.join(''), /Approved/);
+});
+
+test('stop ends the agent and takes it off the roster for good', async () => {
+  const { s, id, child } = await turn([line({ type: 'result', is_error: false, result: 'Done.' })]);
+  const removed = nextEvent(s, 'update');
+  assert.equal(s.stop(id), true);
+  assert.deepEqual(await removed, [], 'the pill hears it is gone');
+  assert.ok(child.killed);
+
+  child.stdout.write(line({ type: 'result', is_error: false, result: 'late output' }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(s.list(), [], 'late output cannot resurrect it');
+  assert.equal(s.send(id, 'hello'), false);
+  assert.equal(s.stop(id), false, 'stopping twice is harmless');
+});
+
+test('stopping a running agent kills it mid-turn', async () => {
+  const s = new Sessions(fakeSpawn);
+  const id = s.start({ label: 'busy' });
+  const child = fakeSpawn.last;
+  s.send(id, 'long job');
+  assert.equal(s.list()[0].state, 'running');
+  s.stop(id);
+  assert.ok(child.killed);
+  assert.deepEqual(s.list(), []);
 });
 
 test('a failed turn lands in error, not waiting', async () => {
