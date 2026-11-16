@@ -1,4 +1,8 @@
+import { useRef } from 'react';
 import PillWaveform from './PillWaveform.jsx';
+
+// How far a press has to travel before it is a drag rather than a click.
+const DRAG_SLOP = 4;
 
 const DOT = {
   running: 'bg-state-running',
@@ -18,10 +22,45 @@ export default function Pill({ sorted, waitingCount, notice, mic, onToggle, onAd
   // Past 8 the dots stop being readable, so collapse them into the count.
   const tooMany = sorted.length > 8;
 
+  // The bar is both the toggle and the handle you move the pill by. It can't
+  // be a -webkit-app-region: drag region -- the OS takes every press on one
+  // for window dragging, so the click never reaches the page and the pill
+  // could never be opened or closed. So: a press that barely moves is a
+  // click; one that travels past DRAG_SLOP moves the window, via main.
+  const press = useRef(null);
+  const onPointerDown = (e) => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    press.current = { x: e.screenX, y: e.screenY, moved: false };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onPointerMove = (e) => {
+    const p = press.current;
+    if (!p) return;
+    if (!p.moved && Math.hypot(e.screenX - p.x, e.screenY - p.y) > DRAG_SLOP) {
+      p.moved = true;
+      axo.dragStart();
+    }
+    if (p.moved) axo.dragMove();
+  };
+  const onPointerUp = () => {
+    const p = press.current;
+    press.current = null;
+    if (!p) return;
+    if (p.moved) axo.dragEnd();
+    else onToggle();
+  };
+  const onPointerCancel = () => {
+    if (press.current?.moved) axo.dragEnd();
+    press.current = null;
+  };
+
   return (
     <div
-      className="drag flex h-11 flex-none cursor-pointer items-center gap-2 px-3.5"
-      onClick={onToggle}
+      className="flex h-11 flex-none cursor-pointer items-center gap-2 px-3.5"
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
     >
       {listening ? (
         <>
