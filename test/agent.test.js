@@ -6,19 +6,22 @@ const test = require('node:test');
 const assert = require('node:assert');
 const { PassThrough } = require('node:stream');
 const { EventEmitter } = require('node:events');
-const { Sessions, brief } = require('../src/helpers/agent');
+const fs = require('node:fs');
+const { Sessions, brief, ruleFor } = require('../src/helpers/agent');
 
-function fakeSpawn() {
+function fakeSpawn(cmd, args) {
   const child = new EventEmitter();
+  child.args = args;
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.stdin = new PassThrough();
   child.written = [];
   child.stdin.on('data', (d) => child.written.push(String(d)));
-  child.kill = () => child.emit('exit', 0);
+  child.kill = () => { child.killed = true; child.emit('exit', 0); };
   fakeSpawn.last = child;
   return child;
 }
+const argAfter = (args, flag) => args[args.indexOf(flag) + 1];
 const line = (o) => JSON.stringify(o) + '\n';
 
 // PassThrough writes don't keep node alive on their own; the timer does, and
@@ -87,21 +90,66 @@ test('a trailing question mark makes it a question, not a finished turn', async 
   assert.equal(rec.waiting_kind, 'question');
 });
 
-test('approve continues the same session instead of starting a new one', async () => {
-  const { rec, s, id, child } = await turn([
-    line({
-      type: 'result', is_error: false, result: 'Blocked.',
-      permission_denials: [{ tool_name: 'Bash', tool_use_id: 't1', tool_input: { command: 'rm x' } }],
-    }),
-  ]);
+const denial = (command) => line({
+  type: 'result', is_error: false, result: 'Blocked.',
+  permission_denials: [{ tool_name: 'Bash', tool_use_id: 't1', tool_input: { command } }],
+});
+
+test('a new session is pinned to its id and starts with no grants', async () => {
+  const { child, id } = await turn([denial('rm x')]);
+  assert.equal(argAfter(child.args, '--session-id'), id);
+  assert.ok(!child.args.includes('--resume'));
+  assert.ok(!child.args.includes('--settings'));
+});
+
+test('approve reopens the same session with a grant for exactly the denied call', async () => {
+  const { rec, s, id, child } = await turn([denial('node -e "console.log(6*7)"')]);
   assert.equal(rec.waiting_kind, 'approval_request');
 
   assert.equal(s.approve(id), true);
+  const next = fakeSpawn.last;
+  assert.notEqual(next, child, 'the permission-blind process is replaced');
+  assert.ok(child.killed);
+  assert.equal(argAfter(next.args, '--resume'), id, 'same session, not a fork');
+  assert.ok(!next.args.includes('--session-id'));
+  const settings = JSON.parse(fs.readFileSync(argAfter(next.args, '--settings'), 'utf8'));
+  assert.deepEqual(settings.permissions.allow, ['Bash(node -e "console.log(6*7)")']);
+  assert.ok(next.args.every((a) => !a.includes('console.log')), 'agent text stays out of argv');
+
   const after = s.list()[0];
-  assert.equal(after.state, 'running');
+  assert.equal(after.state, 'running', "the old process's exit must not flip it idle");
   assert.equal(after.waiting_kind, null, 'stale approval must not linger');
   assert.deepEqual(after.pending, []);
-  assert.match(child.written.join(''), /Approved/);
+  assert.match(next.written.join(''), /Approved.*Bash\(node -e/);
+  assert.equal(child.written.length, 1, 'nothing more goes to the dead process');
+});
+
+test('grants accumulate across approvals in one session', async () => {
+  const { s, id } = await turn([denial('rm a')]);
+  s.approve(id);
+  const second = nextEvent(s, 'waiting');
+  fakeSpawn.last.stdout.write(denial('rm b'));
+  await second;
+  s.approve(id);
+  const allow = JSON.parse(fs.readFileSync(argAfter(fakeSpawn.last.args, '--settings'), 'utf8')).permissions.allow;
+  assert.deepEqual(allow, ['Bash(rm a)', 'Bash(rm b)']);
+});
+
+test('approve is a no-op unless the session is actually waiting on approval', async () => {
+  const { s, id } = await turn([line({ type: 'result', is_error: false, result: 'Done.' })]);
+  const child = fakeSpawn.last;
+  assert.equal(s.approve(id), false);
+  assert.equal(fakeSpawn.last, child, 'no respawn');
+  assert.equal(child.written.length, 1);
+});
+
+test('ruleFor admits exactly the denied call', () => {
+  assert.equal(ruleFor({ tool_name: 'Bash', tool_input: { command: 'rm -rf ./build' } }), 'Bash(rm -rf ./build)');
+  assert.equal(ruleFor({ tool_name: 'WebFetch', tool_input: { url: 'https://docs.example.com/a?b' } }), 'WebFetch(domain:docs.example.com)');
+  assert.equal(ruleFor({ tool_name: 'Write', tool_input: { file_path: '/etc/hosts' } }), 'Edit(//etc/hosts)');
+  assert.equal(ruleFor({ tool_name: 'Read', tool_input: { file_path: '/Users/x/.env' } }), 'Read(//Users/x/.env)');
+  assert.equal(ruleFor({ tool_name: 'mcp__srv__do', tool_input: {} }), 'mcp__srv__do');
+  assert.equal(ruleFor({ tool_name: 'Write', tool_input: { file_path: 'relative.txt' } }), 'Write');
 });
 
 test('a failed turn lands in error, not waiting', async () => {
