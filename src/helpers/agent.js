@@ -6,6 +6,9 @@
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const readline = require('node:readline');
 
 const blockText = (msg) => (Array.isArray(msg?.content) ? msg.content : [])
@@ -39,19 +42,52 @@ const argPreview = (input) => {
   return s.length > 60 ? s.slice(0, 59) + '\u2026' : s;
 };
 
+/** The narrowest permission rule that lets exactly the denied call through, in
+ *  Claude Code's own rule syntax. File tools take `//` + an absolute path
+ *  (one Edit rule covers Write/MultiEdit/NotebookEdit too). Anything without a
+ *  narrower form falls back to the bare tool name -- still scoped to the one
+ *  session it was approved in. */
+const ruleFor = ({ tool_name: tool, tool_input: input = {} }) => {
+  if (!tool) return null;
+  if (tool === 'Bash' && input.command) return `Bash(${input.command})`;
+  if (tool === 'WebFetch' && input.url) {
+    try { return `WebFetch(domain:${new URL(input.url).hostname})`; } catch { /* bare name */ }
+  }
+  const file = input.file_path ?? input.notebook_path;
+  if (typeof file === 'string' && file.startsWith('/')) {
+    return `${tool === 'Read' ? 'Read' : 'Edit'}(/${file})`;
+  }
+  return tool;
+};
+
+// Approved rules go to a settings file rather than argv: they carry
+// agent-written text (a whole shell command), and on Windows argv goes through
+// a shell. mkdtemp makes the directory ours alone (0700), even on a shared /tmp.
+let grantsDir = null;
+const writeGrants = (id, allow) => {
+  grantsDir ??= fs.mkdtempSync(path.join(os.tmpdir(), 'axo-link-'));
+  const file = path.join(grantsDir, `${id}.json`);
+  fs.writeFileSync(file, JSON.stringify({ permissions: { allow } }), { mode: 0o600 });
+  return file;
+};
+
 // ponytail: a plain object per vendor, not a driver class. codex/grok slot in
 // as two more entries with different args, no class hierarchy.
 const VENDORS = {
   claude: {
     cmd: 'claude',
-    args: (sid) => [
+    args: (sid, { resume = false, settings = null } = {}) => [
       '-p',
       '--output-format', 'stream-json',
       '--input-format', 'stream-json',
       '--verbose',                        // required by stream-json output
       '--permission-mode', 'acceptEdits',
-      '--session-id', sid,
+      // A new session is pinned to our id. An approval reopens that same
+      // session -- --resume without --fork-session keeps the id and history.
+      ...(resume ? ['--resume', sid] : ['--session-id', sid]),
+      ...(settings ? ['--settings', settings] : []),
     ],
+    rule: ruleFor,
     write: (t) => JSON.stringify({ type: 'user', message: { role: 'user', content: t } }) + '\n',
     // (line, per-turn scratch) -> state patch, or null for lines we ignore
     parse: (o, turn) => {
@@ -72,6 +108,7 @@ const VENDORS = {
         // record" of what it was blocked from doing. Shape: {tool_name,
         // tool_input, tool_use_id}.
         const denied = Array.isArray(o.permission_denials) ? o.permission_denials : [];
+        turn.denied = denied;   // kept raw: approve() turns these into rules
         const summary = brief(o.result || turn.text);
         return {
           state: o.is_error === true ? 'error' : 'waiting',
@@ -91,7 +128,7 @@ const VENDORS = {
 const freshTurn = () => ({ tools: [], text: '' });
 
 class Sessions extends EventEmitter {
-  #procs = new Map();   // id -> { child, vendor, stderr, turn }
+  #procs = new Map();   // id -> { child, vendor, cwd, allow, stderr, turn }
   #state = new Map();   // id -> record rendered by the pill
   #spawn;
 
@@ -103,18 +140,9 @@ class Sessions extends EventEmitter {
   list() { return [...this.#state.values()]; }
 
   start({ vendor = 'claude', label, cwd = process.cwd() } = {}) {
-    const v = VENDORS[vendor];
-    if (!v) throw new Error(`unknown vendor: ${vendor}`);
+    if (!VENDORS[vendor]) throw new Error(`unknown vendor: ${vendor}`);
     const id = randomUUID();
-    // ponytail: shell:true on Windows resolves the claude.cmd shim. Safe here --
-    // every arg is our own constant or a UUID; user text goes over stdin, never argv.
-    const child = this.#spawn(v.cmd, v.args(id), {
-      cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
-    });
-    const proc = { child, vendor, stderr: '', turn: freshTurn() };
-    this.#procs.set(id, proc);
+    this.#launch(id, { vendor, cwd, allow: [] });
     this.#set(id, {
       id, vendor, cwd,
       label: label || `${vendor} ${id.slice(0, 4)}`,
@@ -122,16 +150,44 @@ class Sessions extends EventEmitter {
       last: '', summary: '', did: '', pending: [],
       since: Date.now(),
     });
+    return id;
+  }
+
+  /** Spawn the CLI process behind session `id`: a fresh session, or (resume)
+   *  the same one reopened with the rules in `allow` granted. */
+  #launch(id, { vendor, cwd, allow }, { resume = false } = {}) {
+    const v = VENDORS[vendor];
+    let settings = allow.length ? writeGrants(id, allow) : null;
+    // ponytail: shell:true on Windows resolves the claude.cmd shim. Safe here --
+    // every arg is our own constant, a UUID, or the path of our own grants file
+    // (quoted for cmd.exe). User and agent text never reach argv: turns go over
+    // stdin, approved rules into that file.
+    const shell = process.platform === 'win32';
+    if (settings && shell) settings = `"${settings}"`;
+    const child = this.#spawn(v.cmd, v.args(id, { resume, settings }), {
+      cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell,
+    });
+    const proc = { child, vendor, cwd, allow, stderr: '', turn: freshTurn() };
+    this.#procs.set(id, proc);
+    // Once approve() has replaced this process, nothing it says or does
+    // (a late line, its own exit) speaks for the session any more.
+    const current = () => this.#procs.get(id) === proc;
 
     readline.createInterface({ input: child.stdout }).on('line', (line) => {
+      if (!current()) return;
       let o;
       try { o = JSON.parse(line); } catch { return; }   // partial/non-JSON noise
       const patch = v.parse(o, proc.turn);
       if (patch) this.#set(id, patch);
     });
     child.stderr?.on('data', (d) => { proc.stderr = (proc.stderr + d).slice(-500); });
-    child.on('error', (e) => this.#set(id, { state: 'error', last: e.message, summary: e.message }));
+    child.on('error', (e) => {
+      if (current()) this.#set(id, { state: 'error', last: e.message, summary: e.message });
+    });
     child.on('exit', (code) => {
+      if (!current()) return;
       this.#procs.delete(id);
       // a clean exit is just an idle session; a crash should say why
       if (code) {
@@ -139,7 +195,7 @@ class Sessions extends EventEmitter {
         this.#set(id, { state: 'error', last: why, summary: brief(why) });
       } else this.#set(id, { state: 'idle' });
     });
-    return id;
+    return proc;
   }
 
   send(id, text) {
@@ -154,12 +210,29 @@ class Sessions extends EventEmitter {
     return true;
   }
 
-  // ponytail: post-hoc approval -- the turn has already settled, so "approved"
-  // is just the next turn on the still-open session. Ceiling: the agent reports
-  // and stops rather than pausing mid-work. Upgrade when voice lands:
-  // --permission-prompt-tool pointed at an MCP `approve` tool returning
-  // {"behavior":"allow"}, which blocks the CLI mid-turn until you answer.
-  approve(id) { return this.send(id, 'Approved. Go ahead and do that.'); }
+  // Saying "approved" down stdin grants nothing: the CLI checks permissions
+  // against its own rules, so the agent retries and hits the same wall. A
+  // running `-p` process can't be granted anything, so approval replaces it --
+  // the same session reopened with a rule for exactly the call that was
+  // denied -- and then says go ahead.
+  // ponytail: post-hoc. The turn has settled, so the agent retries rather than
+  // resuming mid-tool. The mid-turn version is --permission-prompt-tool
+  // pointed at an MCP `approve` tool returning {"behavior":"allow"}.
+  approve(id) {
+    const p = this.#procs.get(id);
+    if (!p || this.#state.get(id)?.waiting_kind !== 'approval_request') return false;
+    const rules = (p.turn.denied || []).map(VENDORS[p.vendor].rule || (() => null)).filter(Boolean);
+    if (!rules.length) return this.send(id, 'Approved. Go ahead and do that.');
+
+    const fresh = rules.filter((r) => !p.allow.includes(r));
+    if (fresh.length) {
+      // New process first, so the old one's exit lands on a session it no
+      // longer owns and can't flash it idle.
+      this.#launch(id, { vendor: p.vendor, cwd: p.cwd, allow: [...p.allow, ...fresh] }, { resume: true });
+      p.child.kill();
+    }
+    return this.send(id, `Approved -- you now have permission for ${rules.join(', ')}. Go ahead and do that.`);
+  }
   deny(id) { return this.send(id, "Denied. Don't do that \u2014 tell me what you'd do instead."); }
 
   stop(id) { this.#procs.get(id)?.child.kill(); }
@@ -175,4 +248,4 @@ class Sessions extends EventEmitter {
   }
 }
 
-module.exports = { Sessions, VENDORS, brief, tally };
+module.exports = { Sessions, VENDORS, brief, tally, ruleFor };

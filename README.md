@@ -35,6 +35,15 @@ Three things are derived from it:
 was blocked from doing, so the approval tab needs no MCP server, no socket, and
 no second process.
 
+**Approve grants exactly what was denied.** Saying "approved" down stdin
+changes nothing — the CLI checks its own permission rules, so the agent just
+hits the same wall. Approve turns each denial into the narrowest rule for that
+call (`Bash(<the command>)`, `WebFetch(domain:<host>)`, `Edit(//<abs path>)`),
+writes it to a settings file, and reopens the *same* session with
+`--resume <id> --settings <file>`, then says go ahead. Rules go in a file, not
+argv, because they carry agent-written text and Windows argv passes through a
+shell.
+
 ## Voice
 
 **It talks.** When a session settles, `speak.js` reads the line out through
@@ -53,10 +62,11 @@ talking over each other.
 It closes itself after ~1.2s of trailing silence, transcribes through OpenAI
 (`gpt-4o-mini-transcribe`), and the text becomes the next turn.
 
-**There is no intent parser, on purpose.** `approve()` and `deny()` were always
-just `send()` with canned English, and the thing receiving it is an LLM. So
-"yeah go ahead" and "no, use redis instead" are both simply the next turn —
-no command grammar, no classifier, no routing pass.
+**There is no intent parser, on purpose.** `deny()` is just `send()` with
+canned English, and the thing receiving it is an LLM. So "yeah go ahead" and
+"no, use redis instead" are both simply the next turn — no command grammar, no
+classifier, no routing pass. The one thing words can't do is grant a
+permission: a blocked command needs the Approve button.
 
 ### Which session hears you
 
@@ -95,9 +105,9 @@ your OS keychain via Electron's `safeStorage`, not in a dotfile.
 npm test
 ```
 
-23 tests: turn settling, the `did` tally, `waiting_kind` classification,
-approve-continues-the-session, crash surfacing, the spoken line, speak-queue
-ordering, and the silence gate.
+Covers turn settling, the `did` tally, `waiting_kind` classification,
+approve-grants-exactly-the-denied-call, crash surfacing, the spoken line,
+speak-queue ordering, and the silence gate.
 
 ```bash
 node smoke.js         # drives the real `claude` binary through two turns
@@ -143,7 +153,8 @@ Deliberately out, with the trigger for adding each:
   clipping you. Costs a Swift helper, a `swiftc` build step, and an Input
   Monitoring permission.
 - **Blocking approvals** — today the agent hits a permission wall, *stops*, and
-  reports; Approve sends "go ahead" as the next turn. The real-time version is
+  reports; Approve reopens the session with that one call granted, and the
+  agent retries it. The real-time version is
   `--permission-prompt-tool` pointed at an MCP `approve` tool returning
   `{"behavior":"allow"}`, which pauses the CLI mid-turn until you answer.
 - **codex / cursor vendors** — two more `VENDORS` entries, but neither binary is
