@@ -162,9 +162,22 @@ class Sessions extends EventEmitter {
   approve(id) { return this.send(id, 'Approved. Go ahead and do that.'); }
   deny(id) { return this.send(id, "Denied. Don't do that \u2014 tell me what you'd do instead."); }
 
-  stop(id) { this.#procs.get(id)?.child.kill(); }
+  /** End the agent and take it off the roster. A stopped session can't take
+   *  another turn, so leaving it listed would just be a dead row. */
+  stop(id) {
+    const p = this.#procs.get(id);
+    this.#procs.delete(id);
+    const listed = this.#state.delete(id);
+    p?.child.kill();
+    if (listed) this.emit('update', this.list());
+    return listed;
+  }
 
   #set(id, patch) {
+    // A stopped session is gone for good: its late stdout or its own exit
+    // must not write it back into the roster as a dead idle row. Only
+    // start(), whose first record carries the id, may create one.
+    if (!this.#state.has(id) && !('id' in patch)) return;
     const prev = this.#state.get(id) || {};
     const next = { ...prev, ...patch };
     if (patch.state && patch.state !== prev.state) next.since = Date.now();

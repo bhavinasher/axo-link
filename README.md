@@ -79,6 +79,8 @@ npm start            # build the renderer, then run
 ```
 
 Hit `+` to pick a folder and start an agent in it. Click the pill to expand.
+The `×` on an agent's row stops it (mid-turn if need be) and takes it off the
+roster.
 
 Voice replies need an OpenAI key. Either export it:
 

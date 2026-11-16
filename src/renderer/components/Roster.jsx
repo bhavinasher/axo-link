@@ -38,6 +38,17 @@ function Row({ s, selected, onSelect }) {
         >
           {kind}
         </span>
+        <button
+          className="-mr-1 flex-none cursor-pointer rounded border-0 bg-transparent px-1 text-[14px] leading-none text-pill-dim transition-colors hover:text-state-error"
+          title={s.state === 'running' ? `Stop ${s.label}` : `Close ${s.label}`}
+          aria-label={`Stop ${s.label}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            axo.stop(s.id);
+          }}
+        >
+          ×
+        </button>
       </div>
 
       <div className="pl-4">
